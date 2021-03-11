@@ -6,7 +6,9 @@
             [clojure.tools.logging :refer [info warn]]
             [analemma [xml :as xml]
                       [svg :as svg]]
-            [maelstrom [util :as u]]))
+            [jepsen [store :as store]]
+            [maelstrom [util :as u]]
+            [maelstrom.net [journal :as j]]))
 
 (def journal-limit
   "SVG rendering is pretty expensive; we stop rendering after this many
@@ -62,7 +64,12 @@
   (let [width  1200
         y-step 20
         truncated? (< journal-limit (count journal))
-        step-count (min journal-limit (count journal))
+        ; Truncate journal
+        full-journal journal
+        journal    (if truncated?
+                     (take journal-limit journal)
+                     journal)
+        step-count (count journal)
         ; + 2 because our ys start at 1.5
         ; + 1 for extra node line height at end
         ; + 2 for truncation notice at end
@@ -74,7 +81,9 @@
                              (assoc node-index node (count node-index)))
                            {}
                            nodes)]
-    {:width       width
+    {:journal             journal
+     :full-journal-count  (count full-journal)
+     :width       width
      :height      height
      :step-count  step-count
      :y-step      y-step
@@ -210,7 +219,7 @@
 
 (defn node-lines
   "Takes a layout and renders the vertical gray lines for each node."
-  [layout journal]
+  [layout]
   (cons :g
         (map (fn [node]
                [:line {:stroke "#ccc"
@@ -222,9 +231,9 @@
 
 (defn message-lines
   "Takes a layout and a journal, and produces a set of lines for each message."
-  [layout journal]
-  (->> journal
-       (take journal-limit)
+  [layout]
+  (->> layout
+       :journal
        messages
        (map (partial message-line layout))
        (cons :g)))
@@ -232,7 +241,7 @@
 (defn truncated-notice
   "Takes a layout and a journal, and renders a warning if we had to truncate
   the journal in this rendering."
-  [layout journal]
+  [layout]
   (when (:truncated? layout)
     (let [step (+ 2 (:step-count layout))
           color "#D96918"]
@@ -247,8 +256,7 @@
                :y (y layout (inc step))
                :fill color
                :text-anchor "middle"}
-        (str (- (count journal) journal-limit)
-             " later network events not shown")]])))
+        (str "Additional network events not shown")]])))
 
 (defn glow-filter
   "A filter to make text stand out better by adding a white glow"
@@ -273,8 +281,18 @@
 (defn plot-analemma!
   "Renders an SVG plot using Analemma. Hopefully faster than Dali, which uses
   reflection EVERYWHERE."
-  [journal filename]
-  (let [layout (layout journal)
+  [test]
+  (let [; First, we need to actually get a subset of the journal to render.
+        ; We just need to go far enough to tell whether we truncated, which is
+        ; the journal limit plus init messages (2 events / msg * 2 messages /
+        ; rpc), plus 1
+        max-id (+ journal-limit (* (count (:nodes test)) 2 2) 1)
+        journal (->> (j/without-init)
+                     (j/up-to-event max-id)
+                     (j/tesser-journal test))
+        ; Compute SVG layout
+        layout (layout journal)
+        ; Render doc
         svg (svg/svg {"version" "2.0"
                       "width"  (+ (:width layout 50))
                       "height" (:height layout)}
@@ -299,8 +317,9 @@ polygon { fill: #000; }"
                (arrowhead)
                (glow-filter)]
               (node-labels      layout)
-              (node-lines       layout journal)
-              (message-lines    layout journal)
-              (truncated-notice layout journal)
-              )]
+              (node-lines       layout)
+              (message-lines    layout)
+              (truncated-notice layout)
+              )
+        filename (store/path test "messages.svg")]
     (spit filename (xml/emit svg))))

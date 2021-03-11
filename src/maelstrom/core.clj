@@ -10,7 +10,7 @@
                        [net :as net]
                        [nemesis :as nemesis]
                        [process :as process]]
-            [maelstrom.net.journal :as net.journal]
+            [maelstrom.net.checker :as net.checker]
             [maelstrom.workload [broadcast :as broadcast]
                                 [echo :as echo]
                                 [g-set :as g-set]
@@ -75,17 +75,17 @@
            {:name    (str (name workload-name))
             :nodes   nodes
             :ssh     {:dummy? true}
+            :os      (net/jepsen-os net)
+            :net     (net/jepsen-net net)
             :db      db
             :nemesis (:nemesis nemesis-package)
-            :net     (net/jepsen-adapter net)
-            :net-journal (:journal @net)
             :checker (checker/compose
                        {:perf       (checker/perf
                                       {:nemeses (:perf nemesis-package)})
                         :timeline   (timeline/html)
                         :exceptions (checker/unhandled-exceptions)
                         :stats      (checker/stats)
-                        :net        (net.journal/checker)
+                        :net        (net.checker/checker)
                         :workload   (:checker workload)})
             :generator generator
             :pure-generators true})))

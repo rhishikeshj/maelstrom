@@ -2,9 +2,12 @@
   "A simulated, mutable unordered network, supporting randomized delivery,
   selective packet loss, and long-lasting partitions."
   (:require [clojure.tools.logging :refer [info warn]]
-            [jepsen.net :as net]
+            [jepsen [core :as jepsen]
+                    [net :as net]
+                    [os :as os]]
             [maelstrom [util :as u]]
-            [maelstrom.net.journal :as j]
+            [maelstrom.net [message :as msg]
+                           [journal :as j]]
             [slingshot.slingshot :refer [try+ throw+]]
             [schema.core :as s]
             [incanter.distributions :as dist
@@ -86,7 +89,10 @@
                       for messages"
   [latency log-send? log-recv?]
   (atom {:queues          {}
-         :journal         (j/journal)
+         ; This will be filled in by the OS adapter--we need this to manage the
+         ; disk file open/close lifecycle, and because we'll need a test map
+         ; with a start time.
+         :journal         nil
          :log-send?       log-send?
          :log-recv?       log-recv?
          :latency-dist    (latency-dist latency)
@@ -95,7 +101,7 @@
          :next-client-id  -1
          :next-message-id (atom -1)}))
 
-(defn jepsen-adapter
+(defn jepsen-net
   "A jepsen.net/Net which controls this network."
   [net]
   (reify net/Net
@@ -113,6 +119,21 @@
 
     (flaky! [_ test]
       (swap! net assoc :p-loss 0.5))))
+
+(defn jepsen-os
+  "A jepsen.os/OS used to start and stop the network."
+  [net]
+  (reify os/OS
+    (setup! [this test node]
+      (when (= node (jepsen/primary test))
+        (info "Starting Maelstrom network")
+        (swap! net assoc :journal (j/journal test))))
+
+    (teardown! [this test node]
+      (when (= node (jepsen/primary test))
+        (when-let [j (:journal @net)]
+          (info "Shutting down Maelstrom network")
+          (j/close! j))))))
 
 (defn add-node!
   "Adds a node to the network."
@@ -143,17 +164,15 @@
 
 (defn validate-msg
   "Checks to make sure a message is well-formed and deliverable on the given
-  network. Returns msg if legal, otherwise throws."
-  [net m]
-  (assert (map? m) (str "Expected message " (pr-str m) " to be a map"))
-  (assert (:src m) (str "No source for message " (pr-str m)))
-  (assert (:dest m) (str "No destination for message " (pr-str m)))
-  (let [queues (get @net :queues)]
+  deref'ed network. Returns msg if legal, otherwise throws."
+  [m net]
+  (let [m (msg/validate m)
+        queues (get net :queues)]
     (assert (get queues (:src m))
             (str "Invalid source for message " (pr-str m)))
     (assert (get queues (:dest m))
-            (str "Invalid dest for message " (pr-str m))))
-  m)
+            (str "Invalid dest for message " (pr-str m)))
+    m))
 
 (defn ^Long latency-for
   "Computes a latency, in ms, for a given message. We want our clients to have
@@ -167,14 +186,22 @@
     (long (draw (:latency-dist net)))))
 
 (defn send!
-  "Sends a message into the network. Message must contain :src and :dest keys,
-  both node IDs. Generates an :id for the message. Mutates and returns the
-  network."
+  "Sends a message (either a map or Message) into the network. Message must
+  contain :src and :dest keys, both node IDs. Generates an :id for the message.
+  Mutates and returns the network."
   [net message]
-  (validate-msg net message)
   (let [{:keys [log-send? p-loss journal next-message-id] :as n} @net
-        ; Assign a new message ID for our internal bookkeeping
-        message (assoc message :id (swap! next-message-id inc))]
+        ; Assign a new message ID for our internal bookkeeping, and construct a
+        ; Message object.
+        message (-> (msg/message (swap! next-message-id inc)
+                                 (:src message)
+                                 (:dest message)
+                                 (:body message))
+                    (validate-msg n))
+        deadline (-> n
+                     (latency-for message)
+                     (* 1000000) ; ms -> ns
+                     (+ (System/nanoTime)))]
 
     ; Journal
     (j/log-send! journal message)
@@ -188,11 +215,8 @@
       (let [src  (:src message)
             dest (:dest message)
             q    (queue-for net dest)]
-        (.put q {:deadline (-> n
-                               (latency-for message)
-                               (* 1000000) ; ms -> ns
-                               (+ (System/nanoTime)))
-                 :message message})
+        (.put q {:deadline deadline
+                 :message  message})
         net))))
 
 (defn recv!
