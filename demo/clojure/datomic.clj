@@ -3,10 +3,25 @@
 (ns maelstrom.datomic
   (:gen-class)
   (:require
-    [cheshire.core :as json]))
+   [cheshire.core :as json]
+   [clojure.walk :as walk]))
 
 
 ;;;;;;;;;;;;;;;;;;; Util functions ;;;;;;;;;;;;;;;;;;;
+
+
+(defn intify-keys
+  [m]
+  (let [f (fn [[k v]]
+            [(try
+               (Integer/parseInt (name k))
+               (catch Exception _
+                 k)) v])]
+    (walk/postwalk (fn [x]
+                     (if (map? x)
+                       (into {} (map f x))
+                       x))
+                   m)))
 
 ;;;;;; Input pre-processing functions ;;;;;;
 
@@ -98,27 +113,33 @@
   (mapv (fn [[f k v :as txn]]
           (case f
             "r"
-            ["r" k (->> {:type "read"
-                         :key k}
-                        (call-service "lin-kv")
-                        :body
-                        :value)]
+            (let [db (->> {:type "read"
+                           :key "root"}
+                          (call-service "lin-kv")
+                          :body
+                          :value
+                          intify-keys)]
+              ["r" k (get db k)])
 
             "append"
-            (let [from (->> {:type "read"
-                             :key k}
-                            (call-service "lin-kv")
-                            :body
-                            :value)
+            (let [from-db (->> {:type "read"
+                                :key "root"}
+                               (call-service "lin-kv")
+                               :body
+                               :value
+                               intify-keys)
                   reply (->> {:type "cas"
-                              :key k
-                              :from from
-                              :to ((fnil conj []) from v)
+                              :key "root"
+                              :from from-db
+                              :to (update from-db k (fnil conj []) v)
                               :create_if_not_exists true}
                              (call-service "lin-kv")
                              :body)]
-              (when (= "cas_ok" (:type reply))
-                txn))))
+              (if (= "cas_ok" (:type reply))
+                txn
+                (do
+                  (printerr (str "CAS NOT OKAY!" reply))
+                  nil)))))
         txns))
 
 
